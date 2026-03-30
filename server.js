@@ -107,44 +107,133 @@ app.get('/api/captcha', (req, res) => {
     res.json({ code: 200, data: captcha.data }); 
 });
 
+// 🚨 改造后的注册接口：注册成功后直接写入 session，实现自动登录
 app.post('/api/register', async (req, res) => {
     const { username, email, password, captcha } = req.body;
     if (!req.session.captcha || req.session.captcha !== captcha.toLowerCase()) {
-        return res.status(400).json({ code: 400, message: "❌ 验证码错误！" });
+        return res.status(400).json({ code: 400, message: "❌ 验证码错误或已过期，请刷新！" });
     }
     try {
-        const passwordHash = bcrypt.hashSync(password, 10);
+        const [blacklisted] = await promisePool.query("SELECT id FROM blacklisted_emails WHERE email = ?", [email]);
+        if (blacklisted.length > 0) return res.status(403).json({ code: 403, message: "⛔ 您的邮箱已被永久拒绝访问！" });
+
+        const salt = bcrypt.genSaltSync(10);
+        const passwordHash = bcrypt.hashSync(password, salt);
         const userId = uuidv4();
+
         await promisePool.query("INSERT INTO user_auth (id, email, password_hash) VALUES (?, ?, ?)", [userId, email, passwordHash]);
         await promisePool.query("INSERT INTO user_profiles (user_id, username) VALUES (?, ?)", [userId, username]);
+
         req.session.captcha = null; 
-        res.json({ code: 200, message: "档案建立成功！" });
+        
+        // 🌟 核心魔法：注册成功后，直接在后端给他签发通行证（Session）
+        req.session.user = { id: userId, email: email, role: 1 };
+        
+        // 告诉前端：你已经是登录状态了！
+        res.json({ 
+            code: 200, 
+            message: "档案建立成功！已为您自动连接星际网络。",
+            user: { username: username, email: email, role: 1 } 
+        });
     } catch (error) {
-        if (error.code === 'ER_DUP_ENTRY') res.status(400).json({ code: 400, message: "❌ 邮箱已被注册！" });
-        else res.status(500).json({ code: 500, message: "服务器错误。" });
+        if (error.code === 'ER_DUP_ENTRY') res.status(400).json({ code: 400, message: "❌ 该邮箱已被注册，请更换！" });
+        else res.status(500).json({ code: 500, message: "服务器内部错误，请稍后再试。" });
     }
 });
 
+// 🔐 装甲版登录接口：支持用户名/邮箱双登，自带精确报错雷达！
 app.post('/api/login', async (req, res) => {
-    const { email, password } = req.body;
+    // 1. 提取参数：兼容前端传来的是 email、username 还是 account
+    const loginAccount = req.body.email || req.body.username || req.body.account;
+    const password = req.body.password;
+    const captcha = req.body.captcha;
+
+    // 2. 验证码防线 (极其严格)
+    if (!captcha || !req.session.captcha || req.session.captcha !== captcha.toLowerCase()) {
+        return res.status(400).json({ code: 400, message: "❌ 验证码错误或已失效，请点击图片刷新！" });
+    }
+
+    if (!loginAccount || !password) {
+        return res.status(400).json({ code: 400, message: "❌ 请输入账号和密码！" });
+    }
+
     try {
-        const [rows] = await promisePool.query(`
-            SELECT a.id, a.email, a.password_hash, a.role, p.username 
-            FROM user_auth a JOIN user_profiles p ON a.id = p.user_id WHERE a.email = ?
-        `, [email]);
-        if (rows.length === 0) return res.status(401).json({ code: 401, message: "❌ 档案不存在！" });
-        const user = rows[0];
-        if (bcrypt.compareSync(password, user.password_hash)) {
-            req.session.user = { id: user.id, email: user.email, role: user.role };
-            res.json({ code: 200, message: "验证通过！", user: { username: user.username, role: user.role } });
-        } else {
-            res.status(401).json({ code: 401, message: "❌ 密钥错误！" });
-        }
+        // 3. 联合查询：不管输入的是邮箱还是用户名，统统一网打尽！
+        const [users] = await promisePool.query(`
+            SELECT a.id, a.email, a.password_hash, p.username, a.role 
+            FROM user_auth a 
+            LEFT JOIN user_profiles p ON a.id = p.user_id 
+            WHERE a.email = ? OR p.username = ?
+        `, [loginAccount, loginAccount]);
+
+        if (users.length === 0) return res.status(401).json({ code: 401, message: "❌ 账号或密码错误！" });
+
+        const user = users[0];
+        
+        // 4. 核对密码
+        const isValidPassword = bcrypt.compareSync(password, user.password_hash);
+        if (!isValidPassword) return res.status(401).json({ code: 401, message: "❌ 账号或密码错误！" });
+
+        // 5. 验证通过后，立刻销毁这张验证码！
+        req.session.captcha = null;
+
+        // 6. 签发通行证
+        req.session.user = { id: user.id, email: user.email, role: user.role || 1 };
+        res.json({ 
+            code: 200, 
+            message: "✅ 登录成功！", 
+            user: { username: user.username, email: user.email, role: user.role || 1 } 
+        });
+
     } catch (error) {
-        res.status(500).json({ code: 500, message: "服务器内部错误" });
+        // 🚨 终极雷达：如果崩溃了，把真正的死因打印在 NAS 后台，并且直接弹窗告诉你！
+        console.error("🚨 登录接口遭遇致命崩溃:", error);
+        res.status(500).json({ 
+            code: 500, 
+            // 把底层的真实错误消息返回给前端弹窗，瞬间破案！
+            message: `服务器崩溃雷达: ${error.message}` 
+        });
     }
 });
+// ✏️ 新增：修改画作与动态内容 (支持更换图片或仅修改文字)
+app.put('/api/posts/:id', uploadPost.fields([
+    { name: 'image', maxCount: 1 }, 
+    { name: 'thumbnail', maxCount: 1 }
+]), async (req, res) => {
+    if (!req.session.user) return res.status(401).json({ code: 401, message: "未登录" });
+    const postId = req.params.id;
+    const userId = req.session.user.id;
+    const { title, content, is_public } = req.body;
+    const isPublicNum = (is_public === 'true' || is_public === '1' || is_public === 1) ? 1 : 0;
 
+    try {
+        // 先验证这幅画是不是他的
+        const [posts] = await promisePool.query("SELECT id FROM posts WHERE id = ? AND user_id = ?", [postId, userId]);
+        if (posts.length === 0) return res.status(403).json({ code: 403, message: "⛔ 权限不足" });
+
+        // 如果用户上传了新图片
+        if (req.files && req.files['image']) {
+            const imageUrl = `/uploads/${req.files['image'][0].filename}`;
+            let thumbUrl = imageUrl;
+            if (req.files['thumbnail'] && req.files['thumbnail'].length > 0) {
+                thumbUrl = `/uploads/${req.files['thumbnail'][0].filename}`;
+            }
+            await promisePool.query(
+                "UPDATE posts SET image_url = ?, thumb_url = ?, title = ?, content = ?, is_public = ? WHERE id = ?",
+                [imageUrl, thumbUrl, title || '', content || '', isPublicNum, postId]
+            );
+        } else {
+            // 如果没有传新图片，只更新文字和状态
+            await promisePool.query(
+                "UPDATE posts SET title = ?, content = ?, is_public = ? WHERE id = ?",
+                [title || '', content || '', isPublicNum, postId]
+            );
+        }
+        res.json({ code: 200, message: "✅ 画作档案已更新！" });
+    } catch (error) {
+        res.status(500).json({ code: 500, message: "更新失败" });
+    }
+});
 // ================== 5. 用户档案模块 (Profile) ==================
 // ================== 🌟 站长控制台模块 (Admin) ==================
 const requireAdmin = (req, res, next) => {
