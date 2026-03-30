@@ -72,7 +72,15 @@ const postStorage = multer.diskStorage({
     }
 });
 const uploadPost = multer({ storage: postStorage, limits: { fileSize: 10 * 1024 * 1024 } });
-
+// 🚨 补上这一段：📸 规则 C：主页背景图专属通道 (最高 10MB)
+// ==========================================
+const coverStorage = multer.diskStorage({
+    destination: function (req, file, cb) { cb(null, uploadDir); },
+    filename: function (req, file, cb) {
+        cb(null, getUniqueFilename('cover', req.session?.user?.id, file.originalname));
+    }
+});
+const uploadCover = multer({ storage: coverStorage, limits: { fileSize: 10 * 1024 * 1024 } });
 // ================== 3. 数据库连接 ==================
 // 🚨 务必确认你的 MySQL 连接配置正确
 const pool = mysql.createPool({
@@ -96,6 +104,175 @@ async function checkDB() {
     }
 }
 checkDB();
+// ==========================================
+// 🔍 量子模糊搜索中心 (跨表同时搜用户、题目、内容)
+// ==========================================
+app.get('/api/search', async (req, res) => {
+    const query = req.query.q; // 获取搜索关键字
+
+    // 1. 基础验证
+    if (!query || query.trim() === '') {
+        return res.status(400).json({ code: 400, message: "请输入搜索内容" });
+    }
+
+    const searchTerm = `%${query.trim()}%`; // 建立数据库 LIKE 查询所需的通配符
+
+    try {
+        // 2. 🚨 开启多线程并行查询 (大厂标准，绝不排队)
+        const [usersPromise, postsPromise] = [
+            // A. 查询可能的匹配用户 (模糊搜用户名)
+            promisePool.query(
+                "SELECT user_id, username, avatar_url FROM user_profiles WHERE username LIKE ?", 
+                [searchTerm]
+            ),
+            // B. 查询可能的匹配画作 (模糊搜题目、内容)
+            // 🚨 魔法：为了界面简洁，直接在这里 JOIN 拿到作者头像
+            promisePool.query(`
+                SELECT p.id, p.title, p.content, p.thumb_url, u.username as author_name, u.avatar_url as author_avatar
+                FROM posts p
+                LEFT JOIN user_profiles u ON p.user_id = u.user_id
+                WHERE p.title LIKE ? OR p.content LIKE ?
+            `, [searchTerm, searchTerm])
+        ];
+
+        // 3. 等待所有查询结果集结
+        const [[users], [posts]] = await Promise.all([usersPromise, postsPromise]);
+
+        // 4. 组装结果并返回
+        res.json({
+            code: 200,
+            message: "✅ 搜索完成",
+            results: {
+                users: users || [], // 用户匹配项
+                posts: posts || []  // 画作匹配项
+            }
+        });
+
+    } catch (error) {
+        console.error("🚨 搜索接口崩溃:", error);
+        res.status(500).json({ code: 500, message: "搜索异常，请稍后再试" });
+    }
+});
+// ==========================================
+// 🌍 个人主页核心引擎 (支持查看自己与查看他人) - 联合查询修复版
+// ==========================================
+app.get('/api/users/:id', async (req, res) => {
+    const targetId = req.params.id;
+    const currentUserId = req.session.user ? req.session.user.id : null;
+    let isMe = false;
+    let actualTargetId = targetId;
+
+    // 1. 身份智能识别
+    if (targetId === 'me') {
+        if (!currentUserId) return res.status(401).json({ code: 401, message: "未登录" });
+        actualTargetId = currentUserId;
+        isMe = true;
+    } else if (targetId === currentUserId) {
+        isMe = true;
+    }
+
+    try {
+// 🚨 更新后的查询：把精神状态、坐标、能量值、BGM全拿出来
+        const [users] = await promisePool.query(`
+            SELECT p.user_id, p.username, p.avatar_url, p.birthday, p.cover_url, p.gender, p.bio, 
+                   p.mental_state, p.galaxy_coords, p.creative_energy, p.bgm_id, 
+                   a.role 
+            FROM user_profiles p
+            LEFT JOIN user_auth a ON p.user_id = a.id
+            WHERE p.user_id = ?
+        `, [actualTargetId]);
+        
+        if (users.length === 0) return res.status(404).json({ code: 404, message: "👻 浩瀚宇宙，未找到该名星际访客。" });
+        const userInfo = users[0];
+
+        // 3. 拉取画廊（权限分级：自己看全部，外人看公开）
+        let postsQuery = "";
+        let queryParams = [actualTargetId];
+        
+        if (isMe) {
+            postsQuery = "SELECT * FROM posts WHERE user_id = ? ORDER BY created_at DESC";
+        } else {
+            postsQuery = "SELECT * FROM posts WHERE user_id = ? AND is_public = 1 ORDER BY created_at DESC";
+        }
+        
+        const [posts] = await promisePool.query(postsQuery, queryParams);
+
+        // 4. 返回完整主页数据包
+        res.json({
+            code: 200,
+            isMe: isMe,
+            user: userInfo,
+            posts: posts
+        });
+    } catch (error) {
+        // 🚨 终极雷达：把底层的真实错误消息打出来！
+        console.error("🚨 主页接口遭遇致命崩溃:", error);
+        res.status(500).json({ code: 500, message: `服务器崩溃雷达: ${error.message}` });
+    }
+});
+// ==========================================
+// 🔧 赛博工作台专属：高级档案重塑接口
+// ==========================================
+app.put('/api/user/profile/advanced', async (req, res) => {
+    // 1. 验证通行证
+    if (!req.session.user) return res.status(401).json({ code: 401, message: "未登录" });
+    
+    // 2. 接收前端面板传来的所有炫酷参数
+    const { bio, mental_state, galaxy_coords, creative_energy, birthday } = req.body;
+    
+    try {
+        // 3. 强行覆写进数据库
+        await promisePool.query(
+            `UPDATE user_profiles 
+             SET bio = ?, mental_state = ?, galaxy_coords = ?, creative_energy = ?, birthday = ? 
+             WHERE user_id = ?`,
+            [
+                bio || '', 
+                mental_state || ' Void-gazing', 
+                galaxy_coords || '', 
+                creative_energy || 80, 
+                birthday || null, 
+                req.session.user.id
+            ]
+        );
+        res.json({ code: 200, message: "✅ 星际档案全息同步完毕！" });
+    } catch (error) {
+        console.error("🚨 档案重塑遭遇物理学崩塌:", error);
+        res.status(500).json({ code: 500, message: "同步失败，请检查数据库连线。" });
+    }
+});
+// ✏️ 全能档案更新接口 (整合签名、性别、生日)
+app.put('/api/user/profile', async (req, res) => {
+    if (!req.session.user) return res.status(401).json({ code: 401, message: "未登录" });
+    const { bio, gender, birthday } = req.body;
+    try {
+        await promisePool.query(
+            "UPDATE user_profiles SET bio = ?, gender = ?, birthday = ? WHERE user_id = ?",
+            [bio || '', gender || 'secret', birthday || null, req.session.user.id]
+        );
+        res.json({ code: 200, message: "✅ 星际档案已更新" });
+    } catch (error) {
+        res.status(500).json({ code: 500, message: "更新失败" });
+    }
+});
+
+// 🖼️ 背景图专属上传接口 (复用你的 upload 中间件)
+// ❌ 把原来这行：
+// app.post('/api/user/cover', upload.single('cover'), async (req, res) => {
+
+// ✅ 换成这行：
+app.post('/api/user/cover', uploadCover.single('cover'), async (req, res) => {
+    if (!req.session.user) return res.status(401).json({ code: 401, message: "未登录" });
+    if (!req.file) return res.status(400).json({ code: 400, message: "请选择背景图片" });
+
+    const coverUrl = `/uploads/${req.file.filename}`;
+    try {
+        await promisePool.query("UPDATE user_profiles SET cover_url = ? WHERE user_id = ?", [coverUrl, req.session.user.id]);
+        res.json({ code: 200, message: "背景更换成功", data: { coverUrl } });
+    } catch (error) {
+        res.status(500).json({ code: 500, message: "背景上传失败" });
+    }
+});
 
 // ✅ 恢复成原本完美运行的版本
 app.get('/api/captcha', (req, res) => {
