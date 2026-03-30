@@ -146,6 +146,42 @@ app.post('/api/login', async (req, res) => {
 });
 
 // ================== 5. 用户档案模块 (Profile) ==================
+// ================== 🌟 站长控制台模块 (Admin) ==================
+const requireAdmin = (req, res, next) => {
+    if (!req.session.user || req.session.user.role !== 99) return res.status(403).json({ code: 403, message: "⛔ 越权警告！" });
+    next();
+};
+
+app.get('/api/admin/users', requireAdmin, async (req, res) => {
+    try {
+        const [users] = await promisePool.query(`
+            SELECT a.id, a.email, a.role, a.banned_until, p.username, a.created_at 
+            FROM user_auth a JOIN user_profiles p ON a.id = p.user_id ORDER BY a.created_at DESC
+        `);
+        res.json({ code: 200, data: users });
+    } catch (error) {
+        res.status(500).json({ code: 500, message: "获取名单失败" });
+    }
+});
+
+app.post('/api/admin/operate', requireAdmin, async (req, res) => {
+    const { targetId, targetEmail, action, days } = req.body;
+    if (targetId === req.session.user.id) return res.status(400).json({ code: 400, message: "❌ 不能制裁自己！" });
+
+    try {
+        if (action === 'ban') {
+            await promisePool.query("UPDATE user_auth SET banned_until = DATE_ADD(NOW(), INTERVAL ? DAY) WHERE id = ?", [days, targetId]);
+        } else if (action === 'unban') {
+            await promisePool.query("UPDATE user_auth SET banned_until = NULL WHERE id = ?", [targetId]);
+        } else if (action === 'blacklist') {
+            await promisePool.query("DELETE FROM user_auth WHERE id = ?", [targetId]);
+            await promisePool.query("INSERT INTO blacklisted_emails (email, reason) VALUES (?, '最高站长制裁')", [targetEmail]);
+        }
+        res.json({ code: 200, message: "✅ 制裁指令执行成功！" });
+    } catch (error) {
+        res.status(500).json({ code: 500, message: "指令执行失败" });
+    }
+});
 app.get('/api/user/profile', async (req, res) => {
     if (!req.session.user) return res.status(401).json({ code: 401, message: "未登录" });
     try {
