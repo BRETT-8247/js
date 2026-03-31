@@ -11,7 +11,26 @@ const fs = require('fs');
 
 const app = express();
 const port = 3000;
+// 🚨 新增：引入原生 http 和 socket.io
+const http = require('http');
+const { Server } = require('socket.io');
 
+// 🚨 核心改造：将 express 包装进 http server，并挂载 io 引擎
+const server = http.createServer(app);
+const io = new Server(server, {
+    cors: {
+        origin: 'https://zzjwyc.xyz', // 换成你的前端域名
+        credentials: true
+    }
+});
+
+// 📡 启动量子监听阵列
+io.on('connection', (socket) => {
+    // 用户前端传来自己的 ID，为其开辟专属雷达频段
+    socket.on('register_radar', (userId) => {
+        socket.join(`radar_${userId}`);
+    });
+});
 // ================== 1. 基础环境与安全配置 ==================
 app.set('trust proxy', 1);
 
@@ -452,7 +471,7 @@ app.get('/api/user/profile', async (req, res) => {
     if (!req.session.user) return res.status(401).json({ code: 401, message: "未登录" });
     try {
         const [users] = await promisePool.query(`
-            SELECT p.username, p.avatar_url, p.birthday, a.role 
+            SELECT a.id, p.username, p.avatar_url, p.birthday, a.role 
             FROM user_auth a JOIN user_profiles p ON a.id = p.user_id WHERE a.id = ?
         `, [req.session.user.id]);
         res.json({ code: 200, data: users[0] });
@@ -666,6 +685,18 @@ app.post('/api/posts/:id/like', async (req, res) => {
             res.json({ code: 200, action: 'unliked' });
         } else {
             await promisePool.query("INSERT INTO likes (post_id, user_id) VALUES (?, ?)", [postId, userId]);
+            
+            // 🚨 发射雷达信号：查出画作主人，并推送通知 (不要发给自己)
+            const [posts] = await promisePool.query("SELECT user_id, title FROM posts WHERE id = ?", [postId]);
+            if (posts.length > 0 && posts[0].user_id !== userId) {
+                io.to(`radar_${posts[0].user_id}`).emit('radar_alert', {
+                    id: Date.now(),
+                    type: 'like',
+                    message: `有人点亮了你的星辰:《${posts[0].title || '无题'}》`,
+                    time: new Date()
+                });
+            }
+            
             res.json({ code: 200, action: 'liked' });
         }
     } catch (error) { res.status(500).json({ code: 500, message: "点赞失败" }); }
@@ -677,9 +708,9 @@ app.get('/api/posts/:id/comments', async (req, res) => {
     try {
         // 终极缝合 Collation (如果此时报错 Illeagl mix of collations，请再次运行 SQL SQL SQL)
         const [comments] = await promisePool.query(`
-            SELECT c.id, c.content, c.created_at, u.username, u.avatar_url 
-            FROM comments c JOIN user_profiles u ON c.user_id = u.user_id 
-            WHERE c.post_id = ? ORDER BY c.created_at ASC
+            SELECT c.id, c.user_id, c.content, c.created_at, u.username, u.avatar_url 
+    FROM comments c JOIN user_profiles u ON c.user_id = u.user_id 
+    WHERE c.post_id = ? ORDER BY c.created_at ASC
         `, [req.params.id]);
         res.json({ code: 200, data: comments });
     } catch (error) { res.status(500).json({ code: 500, message: "获取评论失败" }); }
@@ -693,12 +724,27 @@ app.post('/api/posts/:id/comments', async (req, res) => {
     try {
         await promisePool.query("INSERT INTO comments (post_id, user_id, content) VALUES (?, ?, ?)", 
         [req.params.id, req.session.user.id, content]);
+        
+        // 🚨 发射雷达信号：有人评论了！
+        const [posts] = await promisePool.query("SELECT user_id, title FROM posts WHERE id = ?", [req.params.id]);
+        if (posts.length > 0 && posts[0].user_id !== req.session.user.id) {
+            io.to(`radar_${posts[0].user_id}`).emit('radar_alert', {
+                id: Date.now(),
+                type: 'comment',
+                message: `收到新留言:《${posts[0].title || '无题'}》- "${content.substring(0, 10)}..."`,
+                time: new Date()
+            });
+        }
+
         res.json({ code: 200, message: "评论发布成功！抢到沙发了！" });
     } catch (error) { res.status(500).json({ code: 500, message: "服务器开小差了，评论失败。" }); }
 });
 
 // ================== 启动服务器 ==================
-app.listen(port, '0.0.0.0', () => {
+
+// 🚨 注意：现在是 server.listen，不是 app.listen
+server.listen(port, '0.0.0.0', () => {
     console.log(`🟢 商用级后端服务器已启动：http://0.0.0.0:${port}`);
     console.log(`🟢 [私域画廊管理系统 v2] 全线接口就位， uploads 物理路径：${uploadDir}`);
+
 });
